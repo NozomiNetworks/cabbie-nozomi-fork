@@ -5,7 +5,7 @@ go 1.18
 require (
 	github.com/go-ole/go-ole v1.2.5
 	github.com/google/aukera v0.0.0-20201117230544-d145c8357fea
-	github.com/google/cabbie v1.0.5
+	github.com/google/cabbie v1.0.6-0.20241217145420-c440467a858b
 	github.com/google/deck v0.0.0-20221201002015-b833469335f8
 	github.com/google/glazier v0.0.0-20210617205946-bf91b619f5d4
 	github.com/google/go-cmp v0.5.4
@@ -18,10 +18,10 @@ require (
 )
 
 require (
+	github.com/StackExchange/wmi v1.2.0 // indirect
 	github.com/google/logger v1.1.1 // indirect
 	github.com/iamacarpet/go-win64api v0.0.0-20210311141720-fe38760bed28 // indirect
 	github.com/nu7hatch/gouuid v0.0.0-20131221200532-179d4d0c4d8d // indirect
 	github.com/robfig/cron/v3 v3.0.1 // indirect
-	github.com/StackExchange/wmi v1.2.0 // indirect
 	golang.org/x/xerrors v0.0.0-20191204190536-9bdfabe68543 // indirect
 )
