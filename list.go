@@ -92,23 +92,9 @@ func listUpdates(hidden bool, ids bool) ([]string, []string, error) {
 	}
 	defer uc.Close()
 
-	excludes := excludedDrivers.get()
 	var reqUpdates, optUpdates []string
 	devicePatched := true
-outerLoop:
 	for _, u := range uc.Updates {
-		for _, e := range excludes {
-			filterPresent := e.DriverClass != "" || e.UpdateID != ""
-			csFilterAbsentOrMatching := e.DriverClass == "" || e.DriverClass == u.DriverClass
-			idFilterAbsentOrMatching := e.UpdateID == "" || e.UpdateID == u.Identity.UpdateID
-			if filterPresent && csFilterAbsentOrMatching && idFilterAbsentOrMatching {
-				deck.InfofA(
-					"Driver update %q excluded.\nFiltered driver class: %q\nFiltered update ID: %q",
-					u.Title, e.DriverClass, e.UpdateID,
-				).With(eventID(cablib.EvtDriverUpdateExcluded)).Go()
-				continue outerLoop
-			}
-		}
 
 		// Add to optional updates list if the update does not match the required categories.
 		if !u.InCategories(config.RequiredCategories) {

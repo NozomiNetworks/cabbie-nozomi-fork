@@ -31,8 +31,10 @@ import (
 	"github.com/google/cabbie/session"
 	"github.com/google/cabbie/updatecollection"
 	"github.com/google/deck"
+	"github.com/google/aukera/client"
 	"github.com/google/subcommands"
 	"github.com/google/glazier/go/helpers"
+	glazos "github.com/google/glazier/go/os"
 )
 
 // Available flags
@@ -64,7 +66,11 @@ func (i *installCmd) SetFlags(f *flag.FlagSet) {
 	f.BoolVar(&i.deadlineOnly, "deadlineOnly", false, fmt.Sprintf("Install available updates older than %d days", config.Deadline))
 }
 
-var errInvalidFlags = errors.New("invalid flag combination")
+var (
+	errInvalidFlags = errors.New("invalid flag combination")
+	rebootList      = []string{}
+	rebootTime      time.Time
+)
 
 func vetFlags(i installCmd) error {
 	f := 0
@@ -97,7 +103,7 @@ func (i installCmd) Execute(_ context.Context, flags *flag.FlagSet, _ ...any) su
 		fmt.Println("Please reboot to finalize the update installation.")
 		return 6
 	default:
-		fmt.Println("No reboot needed.")
+		fmt.Println("Installation complete; no reboot required.")
 	}
 
 	return subcommands.ExitSuccess
@@ -109,7 +115,7 @@ func (i *installCmd) criteria() (string, []string) {
 	var rc []string
 	switch {
 	case i.all:
-		c = search.BasicSearch
+		c = search.BasicSearch + " AND IsHidden=0 OR Type='Driver'"
 		deck.InfofA("Starting search for all updates: %s", c).With(eventID(cablib.EvtSearch)).Go()
 	case i.drivers:
 		c = "Type='Driver'"
@@ -123,7 +129,7 @@ func (i *installCmd) criteria() (string, []string) {
 		c = search.BasicSearch
 		deck.InfofA("Starting search for KB's %q:\n%s", i.kbs, c).With(eventID(cablib.EvtSearch)).Go()
 	default:
-		c = search.BasicSearch
+		c = search.BasicSearch + " AND IsHidden=0 OR Type='Driver'"
 		rc = config.RequiredCategories
 		deck.InfofA("Starting search for general updates: %s", c).With(eventID(cablib.EvtSearch)).Go()
 	}
@@ -138,10 +144,10 @@ func installingMessage() {
 	}
 }
 
-func rebootMessage(seconds int) {
+func rebootMessage(t time.Time) {
 	deck.InfoA("Updates have been installed, please reboot to complete the installation...").With(eventID(cablib.EvtInstallSuccess)).Go()
 
-	if err := notification.NewRebootMessage(seconds).Push(); err != nil {
+	if err := notification.NewRebootMessage(t).Push(); err != nil {
 		deck.ErrorfA("Failed to create notification:\n%v", err).With(eventID(cablib.EvtErrNotifications)).Go()
 	}
 }
@@ -182,6 +188,13 @@ func installCollection(s *session.UpdateSession, c *updatecollection.Collection)
 	}
 
 	rb, err := inst.RebootRequired()
+	if err != nil {
+		return nil, fmt.Errorf("error getting install RebootRequired:\n %v", err)
+	}
+
+	if err := inst.Commit(); err != nil {
+		return nil, fmt.Errorf("error committing updates:\n %v", err)
+	}
 
 	return &installRsp{
 		hResult:        hr,
@@ -191,8 +204,6 @@ func installCollection(s *session.UpdateSession, c *updatecollection.Collection)
 }
 
 func (i *installCmd) installUpdates() error {
-	var rebootRequired bool
-
 	// Check for reboot status when not installing virus definitions.
 	if !(i.virusDef) {
 		rebootRequired, err := cablib.RebootRequired()
@@ -211,12 +222,9 @@ func (i *installCmd) installUpdates() error {
 				return fmt.Errorf("Error getting reboot time: %v", err)
 			}
 			if t.IsZero() {
-				// Set reboot time if a reboot is pending but no time has been set.
-				// This can happen when a user installs updates outside of Cabbie.
-				rebootMessage(int(config.RebootDelay))
-				if err := cablib.SetRebootTime(config.RebootDelay); err != nil {
-					return fmt.Errorf("Failed to set reboot time:\n%v", err)
-				}
+				// Don't trigger a reboot if one is pending but no time has been set.
+				// This can happen when updates are installed outside of Cabbie.
+				return nil
 			}
 			rebootEvent <- rebootRequired
 			return nil
@@ -257,7 +265,32 @@ func (i *installCmd) installUpdates() error {
 	installingMinOneUpdate := false
 
 	kbs := NewKBSet(i.kbs)
+	if err := initDriverExclusion(); err != nil {
+		deck.ErrorfA("Error initializing driver exclusions:\n%v", err).With(eventID(cablib.EvtErrDriverExclusion)).Go()
+	}
+	excludes := excludedDrivers.get()
+outerLoop:
 	for _, u := range uc.Updates {
+		for _, e := range excludes {
+			t := time.Time{}
+			if e.DriverDateVer != "" {
+				t, err = time.Parse("2006-01-02", e.DriverDateVer)
+				if err != nil {
+					deck.WarningfA("Failed to parse driver date version provided in exclusion json: %v", err).With(eventID(cablib.EvtErrDriverExclusion)).Go()
+				}
+			}
+			// Check if at least one driver exclusion exists and matches the update being evaluated.
+			driverFilterExists := e.DriverClass != "" || !t.IsZero()
+			driverClassMatch := e.DriverClass == "" || e.DriverClass == u.DriverClass
+			driverVersionMatch := t.IsZero() || t.Equal(u.DriverVerDate)
+			if driverFilterExists && driverClassMatch && driverVersionMatch {
+				deck.InfofA(
+					"Driver update %q excluded.\nFiltered driver class: %q\nFiltered driver date version: %q",
+					u.Title, e.DriverClass, e.DriverDateVer,
+				).With(eventID(cablib.EvtDriverUpdateExcluded)).Go()
+				continue outerLoop
+			}
+		}
 		if !(u.InCategories(rc)) {
 			deck.InfofA("Skipping update %s.\nRequiredClassifications:\n%v\nUpdate classifications:\n%v",
 				u.Title,
@@ -285,6 +318,14 @@ func (i *installCmd) installUpdates() error {
 		if i.deadlineOnly {
 			deadline := time.Duration(config.Deadline) * 24 * time.Hour
 			pastDeadline := time.Now().After(u.LastDeploymentChangeTime.Add(deadline))
+			if u.DriverClass != "" {
+				deck.InfofA(
+					"Skipping driver %s with class %s and date version %s.\nDrivers are only installed during a maintenance window at this time.",
+					u.Title,
+					u.DriverClass,
+					u.DriverVerDate).With(eventID(cablib.EvtUpdateSkip)).Go()
+				continue
+			}
 			if !pastDeadline {
 				deck.InfofA(
 					"Skipping update %s.\nUpdate deployed on %v has not reached the %d day threshold.",
@@ -321,6 +362,7 @@ func (i *installCmd) installUpdates() error {
 			}
 			installingMinOneUpdate = true
 		}
+
 		deck.InfofA("Downloading Update:\n%v", u).With(eventID(cablib.EvtDownload)).Go()
 
 		rc, err := downloadCollection(s, c)
@@ -358,10 +400,19 @@ func (i *installCmd) installUpdates() error {
 			continue
 		}
 
-		deck.InfofA("Install Reboot Required: %t", rsp.rebootRequired).With(eventID(cablib.EvtRebootRequired)).Go()
-		if !rebootRequired {
-			rebootRequired = rsp.rebootRequired
+		deck.InfofA("Install of KB %s; Reboot Required: %t", u.KBArticleIDs, rsp.rebootRequired).With(eventID(cablib.EvtRebootRequired)).Go()
+
+		if rsp.rebootRequired && !u.InCategories([]string{"Definition Updates"}) {
+			deck.InfofA("Adding KB %s to reboot list.", u.KBArticleIDs).With(eventID(cablib.EvtRebootRequired)).Go()
+			rebootList = append(rebootList, u.KBArticleIDs...)
 		}
+
+		if rsp.rebootRequired && u.InCategories([]string{"Upgrades"}) {
+			if err := cablib.SetInstallAtShutdown(); err != nil {
+				deck.ErrorfA("Failed to set `InstallAtShutdown` registry value: %v", err).With(eventID(cablib.EvtErrPowerMgmt)).Go()
+			}
+		}
+
 		c.Close()
 	}
 
@@ -377,12 +428,42 @@ func (i *installCmd) installUpdates() error {
 		}
 	}
 
-	if rebootRequired {
-		rebootMessage(int(config.RebootDelay))
-		if err := cablib.SetRebootTime(config.RebootDelay); err != nil {
-			deck.ErrorfA("Failed to run reboot command:\n%v", err).With(eventID(cablib.EvtErrPowerMgmt)).Go()
+	if len(rebootList) > 0 {
+		if err := cablib.AddRebootUpdates(rebootList); err != nil {
+			deck.ErrorfA("Failed to write updates requiring reboot to registry: %v", err).With(eventID(cablib.EvtRebootRequired)).Go()
 		}
-		rebootEvent <- rebootRequired
+
+		ah, err := client.Label(int(config.AukeraPort), `active_hours`)
+		if err != nil {
+			deck.ErrorfA("Error getting maintenance window %q with error:\n%v", `active_hours`, err).With(eventID(cablib.EvtErrMaintWindow)).Go()
+		}
+
+		osType, err := glazos.GetType()
+		if err != nil {
+			deck.ErrorfA("Error machine type with error:\n%v", err).With(eventID(cablib.EvtErrPowerMgmt)).Go()
+		}
+
+		// Use active hours for client machines.
+		now := time.Now()
+		timerEnd := now.Add(time.Second * time.Duration(config.RebootDelay))
+		if osType == glazos.Client {
+			todayEnd := ah[0].Closes
+			tomorrowEnd := todayEnd.Add(time.Hour * time.Duration(24))
+			// If the active hours end time is in the future, use the end time.
+			// Otherwise, use the same end time of the next day.
+			if todayEnd.After(now) {
+				rebootTime = todayEnd
+			} else {
+				rebootTime = tomorrowEnd
+			}
+		} else {
+			rebootTime = timerEnd
+		}
+		rebootMessage(rebootTime)
+		if err := cablib.SetRebootTime(rebootTime); err != nil {
+			deck.ErrorfA("Failed to set reboot time:\n%v", err).With(eventID(cablib.EvtErrPowerMgmt)).Go()
+		}
+		rebootEvent <- true
 	}
 
 	return nil

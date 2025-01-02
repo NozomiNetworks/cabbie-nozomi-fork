@@ -22,7 +22,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 
@@ -45,13 +44,14 @@ type Enforcements struct {
 	Required        []string        `json:"required"`
 	ExcludedDrivers []DriverExclude `json:"excluded-drivers"`
 	Hidden          []string        `json:"hidden"`
+	HiddenUpdateID  []string        `json:"hidden-UpdateID"`
 }
 
 // DriverExclude specifies criteria to exclude certain driver updates.
 // A driver update is ignored by Cabbie if it matches all criteria.
 type DriverExclude struct {
-	DriverClass string `json:"driver-class"`
-	UpdateID    string `json:"update-id"`
+	DriverClass   string `json:"driver-class"`
+	DriverDateVer string `json:"driver-date-version"`
 }
 
 func enforcements(path string) (Enforcements, error) {
@@ -67,7 +67,7 @@ func enforcements(path string) (Enforcements, error) {
 	if !b {
 		return e, fmt.Errorf("%w: %q", errInvalidFile, path)
 	}
-	data, err := ioutil.ReadFile(path)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return e, fmt.Errorf("error reading file %q: %v", path, err)
 	}
@@ -80,7 +80,7 @@ func enforcements(path string) (Enforcements, error) {
 // Get attempts to return all known external enforcements.
 func Get() (Enforcements, error) {
 	var ret Enforcements
-	files, err := ioutil.ReadDir(enforceDir)
+	files, err := os.ReadDir(enforceDir)
 	if err != nil {
 		return ret, err
 	}
@@ -94,6 +94,7 @@ func Get() (Enforcements, error) {
 		ret.Required = append(ret.Required, e.Required...)
 		ret.Hidden = append(ret.Hidden, e.Hidden...)
 		ret.ExcludedDrivers = append(ret.ExcludedDrivers, e.ExcludedDrivers...)
+		ret.HiddenUpdateID = append(ret.HiddenUpdateID, e.HiddenUpdateID...)
 	}
 	ret.dedupe()
 	return ret, nil
@@ -129,6 +130,7 @@ func uniqueDriverExclude(list []DriverExclude) []DriverExclude {
 func (e *Enforcements) dedupe() {
 	e.Required = uniqueStrings(e.Required)
 	e.Hidden = uniqueStrings(e.Hidden)
+	e.HiddenUpdateID = uniqueStrings(e.HiddenUpdateID)
 	e.ExcludedDrivers = uniqueDriverExclude(e.ExcludedDrivers)
 }
 

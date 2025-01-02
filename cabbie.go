@@ -28,6 +28,8 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/sys/windows"
+
 	"flag"
 	"github.com/google/cabbie/metrics"
 	"github.com/google/cabbie/notification"
@@ -43,14 +45,16 @@ import (
 	"golang.org/x/sys/windows/svc/debug"
 	"golang.org/x/sys/windows/svc"
 	"github.com/google/subcommands"
+	gos "github.com/google/glazier/go/os"
 )
 
 var (
-	runInDebug       = flag.Bool("debug", false, "Run in debug mode")
-	config           = new(Settings)
-	categoryDefaults = []string{"Critical Updates", "Definition Updates", "Security Updates"}
-	rebootEvent      = make(chan bool, 10)
-	rebootActive     = false
+	runInDebug        = flag.Bool("debug", false, "Run in debug mode")
+	runNormalPriority = flag.Bool("normalpriority", false, "If specified cabbie runs at normal priority rather than lowering the process priority")
+	config            = new(Settings)
+	categoryDefaults  = []string{"Critical Updates", "Definition Updates", "Security Updates"}
+	rebootEvent       = make(chan bool, 10)
+	rebootActive      = false
 
 	excludedDrivers driverExcludes
 
@@ -308,8 +312,22 @@ func enforce() error {
 			deck.ErrorA(failures).With(eventID(cablib.EvtErrHide)).Go()
 		}
 	}
-	excludedDrivers.set(updates.ExcludedDrivers)
+	if len(updates.HiddenUpdateID) > 0 {
+		if err := hideByUpdateID(updates.HiddenUpdateID); err != nil {
+			failures = fmt.Errorf("error hiding updates by update ID: %v", err)
+			deck.ErrorA(failures).With(eventID(cablib.EvtErrHide)).Go()
+		}
+	}
 	return failures
+}
+
+func initDriverExclusion() error {
+	updates, err := enforcement.Get()
+	if err != nil {
+		return fmt.Errorf("error retrieving required updates: %v", err)
+	}
+	excludedDrivers.set(updates.ExcludedDrivers)
+	return nil
 }
 
 func runMainLoop() error {
@@ -364,40 +382,76 @@ func runMainLoop() error {
 		case <-t.Default.C:
 			i := installCmd{Interactive: false}
 			err := i.installUpdates()
+			if err != nil {
+				deck.ErrorfA("Error installing system updates:\n%v", err).With(eventID(cablib.EvtErrInstallFailure)).Go()
+			}
 			if e := updateInstallSuccess.Set(err == nil); e != nil {
 				deck.ErrorfA("Error posting metric:\n%v", e).With(eventID(cablib.EvtErrMetricReport)).Go()
 			}
 			setRebootMetric()
-			if err != nil {
-				deck.ErrorfA("Error installing system updates:\n%v", err).With(eventID(cablib.EvtErrInstallFailure)).Go()
-			}
 		case <-t.Aukera.C:
 			s, err := client.Label(int(config.AukeraPort), config.AukeraName)
 			if err != nil {
 				deck.ErrorfA("Error getting maintenance window %q with error:\n%v", config.AukeraName, err).With(eventID(cablib.EvtErrMaintWindow)).Go()
 				break
 			}
+			ah, err := client.Label(int(config.AukeraPort), `active_hours`)
+			if err != nil {
+				deck.ErrorfA("Error getting maintenance window %q with error:\n%v", `active_hours`, err).With(eventID(cablib.EvtErrMaintWindow)).Go()
+				break
+			}
 			if *runInDebug {
 				fmt.Printf("Cabbie maintenance window schedule:\n%+v", s)
+				fmt.Printf("Cabbie active hours schedule:\n%+v", ah)
 			}
 			if len(s) == 0 {
 				deck.ErrorfA("Aukera maintenance window label %q not found, skipping update check...", config.AukeraName).With(eventID(cablib.EvtErrMaintWindow)).Go()
 				break
 			}
-			if s[0].State == "open" {
-				i := installCmd{Interactive: false}
-				err := i.installUpdates()
-				if e := updateInstallSuccess.Set(err == nil); e != nil {
-					deck.ErrorfA("Error posting updateInstallSuccess metric:\n%v", e).With(eventID(cablib.EvtErrMetricReport)).Go()
+			osType, err := gos.GetType()
+			if err != nil {
+				deck.ErrorfA("Error machine type with error:\n%v", err).With(eventID(cablib.EvtErrPowerMgmt)).Go()
+			}
+			if (osType == gos.Client) && (len(ah) != 0) {
+				trimmedOpen := ah[0].Opens.Add(time.Hour)
+				trimmedClose := ah[0].Closes.Add(-time.Hour)
+				now := time.Now()
+				today := time.Now().Day()
+				maintDay := s[0].Opens.Day()
+				tomorrow := today + 1
+				// We're trimming the leading and trailing hours from the active hours window.
+				// As long as the current time is within the trimmed window and the current day is
+				// within the standard `cabbie` maintenance window (or day after), we'll install updates.
+				// TODO: Consider an additional "deadline" timer after week one
+				// to attempt to install updates daily during this trimmed window.
+				if trimmedOpen.Before(now) && trimmedClose.After(now) && ((maintDay == today) || (maintDay == tomorrow)) {
+					i := installCmd{Interactive: false}
+					err := i.installUpdates()
+					if err != nil {
+						deck.ErrorfA("Error installing system updates:\n%v", err).With(eventID(cablib.EvtErrInstallFailure)).Go()
+					}
+					if e := updateInstallSuccess.Set(err == nil); e != nil {
+						deck.ErrorfA("Error posting updateInstallSuccess metric:\n%v", e).With(eventID(cablib.EvtErrMetricReport)).Go()
+					}
+					setRebootMetric()
 				}
-				setRebootMetric()
-				if err != nil {
-					deck.ErrorfA("Error installing system updates:\n%v", err).With(eventID(cablib.EvtErrInstallFailure)).Go()
+			} else {
+				// If we're a server, or we don't have an active hours window, we'll install updates
+				// as long as the standard `cabbie` maintenance window is open.
+				if s[0].State == "open" {
+					i := installCmd{Interactive: false}
+					err := i.installUpdates()
+					if err != nil {
+						deck.ErrorfA("Error installing system updates:\n%v", err).With(eventID(cablib.EvtErrInstallFailure)).Go()
+					}
+					if e := updateInstallSuccess.Set(err == nil); e != nil {
+						deck.ErrorfA("Error posting updateInstallSuccess metric:\n%v", e).With(eventID(cablib.EvtErrMetricReport)).Go()
+					}
+					setRebootMetric()
 				}
 			}
 		case <-t.List.C:
-			setRebootMetric()
-			requiredUpdates, optionalUpdates, err := listUpdates(true, false)
+			requiredUpdates, optionalUpdates, err := listUpdates(false, false)
 			if e := listUpdateSuccess.Set(err == nil); e != nil {
 				deck.ErrorfA("Error posting listUpdateSuccess metric:\n%v", e).With(eventID(cablib.EvtErrMetricReport)).Go()
 			}
@@ -475,6 +529,7 @@ func runMainLoop() error {
 						deck.InfoA("Zero time returned, no reboot defined.").With(eventID(cablib.EvtMisc)).Go()
 						return
 					}
+					deck.InfofA("Reboot time is %s", t.String()).With(eventID(cablib.EvtMisc)).Go()
 					if err := cablib.SystemReboot(t); err != nil {
 						deck.ErrorfA("SystemReboot() error:\n%v", err).With(eventID(cablib.EvtErrPowerMgmt)).Go()
 					}
@@ -540,9 +595,22 @@ func enableThirdPartyUpdates() error {
 	return m.AddService(servicemgr.MicrosoftUpdate)
 }
 
+// Lower the priority of the Cabbie process to IDLE_PRIORITY_CLASS in the OS scheduler and begin
+// background processing to limit user impact see:
+// https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-setpriorityclass
+func lowerProcessPriority() error {
+	return windows.SetPriorityClass(windows.CurrentProcess(), windows.IDLE_PRIORITY_CLASS)
+}
+
 func main() {
 	flag.Parse()
 	var err error
+
+	if !*runNormalPriority {
+		if err := lowerProcessPriority(); err != nil {
+			deck.ErrorfA("Failed to lower process priority: %v", err).With(eventID(cablib.EvtErrMisc)).Go()
+		}
+	}
 
 	if *runInDebug {
 		deck.Add(logger.Init(os.Stdout, 0))
